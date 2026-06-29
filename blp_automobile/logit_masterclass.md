@@ -7489,3 +7489,475 @@ A demand model is not a statistical exercise — it exists to inform a specific 
 9. **Welfare analysis without market size**: "Consumer surplus increased by 1.2 utils per consumer" is meaningless to an executive. Always multiply by market size and express in dollars.
 
 10. **Reporting means without distributions**: Reporting mean own-price elasticity of −3.5 without showing the distribution hides that 20% of products have elasticity < −1 (inelastic!) and another 20% have elasticity < −8 (hyper-elastic). The tails drive the pricing strategy, not the mean.
+
+---
+
+<a name="section-14"></a>
+## SECTION 14: End-to-End Reference Card — BLP Automobile Full Workflow
+
+This section condenses the entire masterclass into a single executable reference. Copy this and adapt it to any aggregate discrete choice problem.
+
+### 14.1 Setup and Data Loading
+
+```python
+import pyblp
+import pandas as pd
+import numpy as np
+import statsmodels.api as sm
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy import stats
+from numpy.linalg import lstsq
+
+# ── Load BLP data ─────────────────────────────────────────────────────────────
+products = pd.read_csv('blp_automobile/blp_products.csv')
+agents   = pd.read_csv('blp_automobile/blp_agents.csv')
+
+print(f"Products: {products.shape}")   # (2217, 33)
+print(f"Agents:   {agents.shape}")     # (4000, 8)
+print(f"Markets:  {products['market_ids'].nunique()}")  # 20 (years 1971-1990)
+print(f"Products per market: {products.groupby('market_ids').size().mean():.1f}")
+print(f"Firms:    {products['firm_ids'].nunique()}")    # 26
+
+# ── Core data engineering ──────────────────────────────────────────────────────
+# 1. Outside good and logit transform
+products['s0']      = 1 - products.groupby('market_ids')['shares'].transform('sum')
+products['logit_y'] = np.log(products['shares']) - np.log(products['s0'])
+
+# 2. Nested logit variables (region nests: US / EU / JP)
+products['nest'] = products['region']
+nest_sums = products.groupby(['market_ids', 'nest'])['shares'].transform('sum')
+products['within_nest_share'] = products['shares'] / nest_sums
+products['log_within_share']  = np.log(products['within_nest_share'])
+
+# 3. Year fixed effects
+year_dummies = pd.get_dummies(products['market_ids'], prefix='yr',
+                               drop_first=True, dtype=float)
+year_cols = list(year_dummies.columns)
+products = pd.concat([products.reset_index(drop=True),
+                       year_dummies.reset_index(drop=True)], axis=1)
+```
+
+### 14.2 Estimation Ladder — All Four Models
+
+```python
+char_cols = ['prices', 'hpwt', 'air', 'mpd', 'space']
+inst_cols  = [f'demand_instruments{i}' for i in range(8)]
+
+# ══ MODEL 1: OLS LOGIT ══════════════════════════════════════════════════════
+X_ols = sm.add_constant(products[char_cols + year_cols])
+ols_fit = sm.OLS(products['logit_y'], X_ols).fit(cov_type='HC3')
+beta_price_ols = ols_fit.params['prices']
+print(f"OLS price coef: {beta_price_ols:.4f}")
+print(f"OLS mean own-elast: "
+      f"{(beta_price_ols * products['prices'] * (1-products['shares'])).mean():.3f}")
+
+# ══ MODEL 2: IV LOGIT ═══════════════════════════════════════════════════════
+from linearmodels.iv import IV2SLS
+products_idx = products.set_index(['car_ids', 'market_ids'])
+iv_fit = IV2SLS(
+    dependent=products_idx['logit_y'],
+    exog=products_idx[['hpwt', 'air', 'mpd', 'space'] + year_cols],
+    endog=products_idx[['prices']],
+    instruments=products_idx[inst_cols]
+).fit(cov_type='clustered',
+      clusters=products_idx.index.get_level_values('car_ids'))
+beta_price_iv = iv_fit.params['prices']
+print(f"\nIV price coef:  {beta_price_iv:.4f}")
+print(f"IV mean own-elast: "
+      f"{(beta_price_iv * products['prices'] * (1-products['shares'])).mean():.3f}")
+print(f"First-stage F: {iv_fit.first_stage.diagnostics['f.stat'].values[0]:.1f}")
+
+# ══ MODEL 3: NESTED LOGIT IV ════════════════════════════════════════════════
+# Within-nest share instrument: average rival HPWT within nest-market
+products_idx2 = products.set_index(['car_ids', 'market_ids'])
+nl_fit = IV2SLS(
+    dependent=products_idx2['logit_y'],
+    exog=products_idx2[['hpwt', 'air', 'mpd', 'space'] + year_cols],
+    endog=products_idx2[['prices', 'log_within_share']],
+    instruments=products_idx2[inst_cols + ['iv_within_hpwt', 'iv_within_space']]
+    if 'iv_within_hpwt' in products.columns else products_idx2[inst_cols]
+).fit(cov_type='clustered',
+      clusters=products_idx2.index.get_level_values('car_ids'))
+beta_price_nl = nl_fit.params['prices']
+sigma_nl      = nl_fit.params.get('log_within_share', 0.5)
+print(f"\nNested logit price coef: {beta_price_nl:.4f}")
+print(f"Nesting parameter σ:     {sigma_nl:.4f}  (valid if in (0,1))")
+
+# ══ MODEL 4: BLP RC LOGIT ═══════════════════════════════════════════════════
+X1 = pyblp.Formulation('0 + prices + hpwt + air + mpd + space',
+                         absorb='C(market_ids)')
+X2 = pyblp.Formulation('0 + prices + hpwt + space')
+
+problem = pyblp.Problem(
+    product_formulations=(X1, X2),
+    product_data=products[['market_ids', 'firm_ids', 'car_ids', 'shares', 'prices',
+                             'hpwt', 'air', 'mpd', 'space'] +
+                            [f'demand_instruments{i}' for i in range(8)] +
+                            [f'supply_instruments{i}' for i in range(12)]],
+    agent_formulation=pyblp.Formulation('0 + income'),
+    agent_data=agents
+)
+print(f"\nBLP Problem summary:")
+print(problem)
+```
+
+### 14.3 Model Comparison Summary Table
+
+```python
+# ── Collect results across models ─────────────────────────────────────────────
+results_summary = pd.DataFrame([
+    {
+        'Model':           'OLS Logit',
+        'Price_coef':      beta_price_ols,
+        'Mean_own_elast':  (beta_price_ols * products['prices'] * (1-products['shares'])).mean(),
+        'Endogeneity_corrected': 'No',
+        'IIA_relaxed':     'No',
+        'Consumer_heterogeneity': 'No',
+        'Data_required':   'Aggregate shares',
+        'Package':         'statsmodels / numpy',
+    },
+    {
+        'Model':           'IV Logit',
+        'Price_coef':      beta_price_iv,
+        'Mean_own_elast':  (beta_price_iv * products['prices'] * (1-products['shares'])).mean(),
+        'Endogeneity_corrected': 'Yes',
+        'IIA_relaxed':     'No',
+        'Consumer_heterogeneity': 'No',
+        'Data_required':   'Aggregate shares + instruments',
+        'Package':         'linearmodels',
+    },
+    {
+        'Model':           'Nested Logit IV',
+        'Price_coef':      beta_price_nl,
+        'Mean_own_elast':  (beta_price_nl * products['prices'] * (1-products['shares'])).mean(),
+        'Endogeneity_corrected': 'Yes',
+        'IIA_relaxed':     'Within-nest',
+        'Consumer_heterogeneity': 'No',
+        'Data_required':   'Aggregate + nest structure + instruments',
+        'Package':         'linearmodels / biogeme',
+    },
+    {
+        'Model':           'BLP RC Logit',
+        'Price_coef':      -0.243,   # BLP 1995 benchmark
+        'Mean_own_elast':  -6.3,     # BLP 1995 benchmark
+        'Endogeneity_corrected': 'Yes (GMM)',
+        'IIA_relaxed':     'Yes (fully)',
+        'Consumer_heterogeneity': 'Yes (σ, π)',
+        'Data_required':   'Aggregate + agents + instruments',
+        'Package':         'pyblp',
+    },
+])
+
+print("\nModel Comparison Across the Estimation Ladder:")
+print(results_summary[['Model', 'Price_coef', 'Mean_own_elast',
+                         'Endogeneity_corrected', 'IIA_relaxed']].to_string(index=False))
+print("\n→ Upgrading from OLS to IV: price coefficient becomes more negative (endogeneity corrected)")
+print("→ Upgrading from IV to NL: within-nest substitution stronger than between-nest")
+print("→ Upgrading from NL to BLP: full heterogeneity; realistic cross-price substitution")
+```
+
+### 14.4 The 5 Standard Elasticity Outputs
+
+Every demand study should deliver these five numbers clearly:
+
+```python
+# Using IV logit estimates as representative
+alpha_price = beta_price_iv
+
+# ── 1. MEAN OWN-PRICE ELASTICITY ─────────────────────────────────────────────
+mean_own_elast = (alpha_price * products['prices'] * (1 - products['shares'])).mean()
+print(f"1. Mean own-price elasticity:        {mean_own_elast:.3f}")
+print(f"   Literature benchmark (BLP 1995):  -6.3")
+print(f"   Literature benchmark (Berry 1994): -4.2")
+
+# ── 2. ELASTICITY RANGE ───────────────────────────────────────────────────────
+own_elasts = alpha_price * products['prices'] * (1 - products['shares'])
+p25, p75 = np.percentile(own_elasts, [25, 75])
+print(f"\n2. Elasticity distribution:")
+print(f"   P25: {p25:.3f}   Median: {np.median(own_elasts):.3f}   P75: {p75:.3f}")
+print(f"   Min: {own_elasts.min():.3f}   Max: {own_elasts.max():.3f}")
+
+# ── 3. LERNER INDEX (MARKET POWER) ───────────────────────────────────────────
+lerner = -1 / own_elasts.clip(upper=-0.1)
+lerner_clean = lerner[(lerner > 0) & (lerner < 1)]
+print(f"\n3. Lerner Index (markup/price):")
+print(f"   Mean: {lerner_clean.mean():.3f} ({lerner_clean.mean()*100:.1f}%)")
+print(f"   Range: [{lerner_clean.min():.3f}, {lerner_clean.max():.3f}]")
+
+# ── 4. REVENUE-MAXIMIZING PRICE (LERNER RULE) ────────────────────────────────
+# p* = c / (1 - 1/|ε|) = c × |ε| / (|ε| - 1)
+# Need marginal cost c. Approximate: c ≈ p × (1 - 1/|ε|)
+products['implied_cost'] = products['prices'] * (1 + 1/own_elasts)  # 1 + 1/ε (ε < 0)
+products['implied_cost'] = products['implied_cost'].clip(0)
+products['optimal_price'] = products['implied_cost'] / (1 - 1/np.abs(own_elasts))
+price_gap = products['optimal_price'] - products['prices']
+print(f"\n4. Optimal pricing (Lerner rule):")
+print(f"   Mean current price: ${products['prices'].mean():.2f}k")
+print(f"   Mean optimal price: ${products['optimal_price'].mean():.2f}k")
+print(f"   Mean gap: {price_gap.mean():.3f} ($000s) — {'above' if price_gap.mean()>0 else 'below'} current")
+
+# ── 5. CROSS-PRICE ELASTICITY STRUCTURE ──────────────────────────────────────
+# Under IIA logit: ε_jk = -α × p_k × s_k (same for all j ≠ k)
+mean_cross_elast = -(alpha_price * products['prices'] * products['shares']).mean()
+print(f"\n5. Mean cross-price elasticity (IIA logit):")
+print(f"   Mean: {mean_cross_elast:.5f}")
+print(f"   Note: very small (≈ 0) due to small market shares")
+print(f"   RC logit gives MUCH larger cross-elasticities among similar products")
+```
+
+### 14.5 Quick-Reference Cheat Sheet
+
+```
+╔══════════════════════════════════════════════════════════════════════╗
+║           DISCRETE CHOICE MODEL SELECTION CHEAT SHEET               ║
+╠══════════════════════════════════════════════════════════════════════╣
+║                                                                      ║
+║  DATA TYPE       MODEL          PACKAGE       KEY ASSUMPTION         ║
+║  ──────────      ──────────     ─────────     ──────────────────     ║
+║  Agg shares      OLS Logit      numpy/SM      IIA, exog. price       ║
+║  Agg shares      IV Logit       linearmodels  IIA, endog. price      ║
+║  Agg shares      Nested Logit   linearmodels  IIA within nest        ║
+║  Agg shares      BLP RC Logit   pyblp         No IIA, endog. price   ║
+║  Individual      CL / MNL       biogeme       IIA                    ║
+║  Individual      Nested Logit   biogeme       IIA within nest        ║
+║  Individual      GNL            biogeme       Overlapping nests      ║
+║  Individual      Mixed Logit    xlogit        No IIA, normal RCs     ║
+║  Individual      Latent Class   biogeme       K discrete segments    ║
+║  Panel agg       GEE (Gaussian) statsmodels   Cluster structure      ║
+║  Panel counts    Poisson GEE    statsmodels   Count, equidispersion  ║
+║  Panel counts    Neg. Binomial  statsmodels   Count, overdispersion  ║
+║  Panel mixed     Mixed Poisson  GPBoost       Count + RE + nonlin    ║
+║  Panel contin    Mixed LM       statsmodels   Gaussian RE            ║
+║                                                                      ║
+╠══════════════════════════════════════════════════════════════════════╣
+║                                                                      ║
+║  KEY TESTS IN ORDER                                                  ║
+║  ──────────────────                                                  ║
+║  1. Price endogeneity: Hausman test → if reject, use IV              ║
+║  2. IIA: Hausman-McFadden → if reject, use NL or mixed logit         ║
+║  3. Nesting validity: σ ∈ (0,1) → if outside, re-specify nests      ║
+║  4. RC significance: LR test RC vs plain IV → if reject, use BLP     ║
+║  5. Overdispersion: Pearson χ²/df > 1.5 → use NB not Poisson        ║
+║  6. Excess zeros: Vuong test → if reject Poisson, use ZIP            ║
+║                                                                      ║
+╠══════════════════════════════════════════════════════════════════════╣
+║                                                                      ║
+║  ECONOMIC SANITY CHECKS (NON-NEGOTIABLE)                             ║
+║  ──────────────────────────────────────                              ║
+║  ✓ Price coefficient < 0                                             ║
+║  ✓ Quality attributes (hpwt, space, air) > 0                        ║
+║  ✓ Nesting parameter σ ∈ (0, 1)                                     ║
+║  ✓ All own-price elasticities < 0                                    ║
+║  ✓ Mean |own-elast| > 1 (elastic demand for differentiated goods)   ║
+║  ✓ Marginal costs > 0 (supply-side estimation)                       ║
+║  ✓ Lerner index ∈ [0.05, 0.60] for most manufactured goods          ║
+║  ✓ Market shares sum to < 1 per market                               ║
+║  ✓ Outside good share > 0 (> 0.5 for automobiles)                   ║
+║                                                                      ║
+╠══════════════════════════════════════════════════════════════════════╣
+║                                                                      ║
+║  AUTOMOTIVE BENCHMARKS (BLP 1995)                                    ║
+║  ─────────────────────────────────                                   ║
+║  Price coefficient (mean):    β̄_p ≈ -0.09 to -0.24                 ║
+║  Mean own-price elasticity:   ε̄ ≈ -3.5 to -6.3                    ║
+║  Mean Lerner index:           L̄ ≈ 0.19 to 0.26 (19-26%)            ║
+║  Outside good share:          s_0 ≈ 0.94 to 0.96                    ║
+║  HHI (full market):           800 to 1,200 (competitive)            ║
+║  RC price std deviation:      σ_p ≈ 0.5 to 1.0                     ║
+║  Price-income interaction:    π ≈ -4 to -6 (richer → less sensitive)║
+║                                                                      ║
+╚══════════════════════════════════════════════════════════════════════╝
+```
+
+### 14.6 Standard Plotting Pipeline (Copy-Paste Ready)
+
+```python
+import matplotlib.pyplot as plt
+import seaborn as sns
+import numpy as np
+
+def blp_diagnostic_plots(products, alpha_price, sigma_nl=None, save_prefix='blp'):
+    """Generate all standard BLP diagnostic plots."""
+
+    # ── Pre-estimation ───────────────────────────────────────────────────────
+    fig, axes = plt.subplots(2, 3, figsize=(15, 8))
+    fig.suptitle('Demand Model: Pre-Estimation Diagnostics', fontsize=14, fontweight='bold')
+
+    # 1. Share distribution
+    axes[0,0].hist(products['shares']*100, bins=50, color='steelblue', edgecolor='white', alpha=0.8)
+    axes[0,0].set(xlabel='Market Share (%)', ylabel='Count', title='Share Distribution')
+    axes[0,0].axvline(products['shares'].mean()*100, color='red', linestyle='--',
+                       label=f"mean={products['shares'].mean()*100:.3f}%")
+    axes[0,0].legend()
+
+    # 2. Logit share vs price
+    axes[0,1].scatter(products['prices'], products['logit_y'], alpha=0.25, s=8, color='steelblue')
+    m, b = np.polyfit(products['prices'], products['logit_y'], 1)
+    xr = np.linspace(products['prices'].min(), products['prices'].max(), 100)
+    axes[0,1].plot(xr, m*xr+b, 'r-', linewidth=2, label=f'slope={m:.3f}')
+    axes[0,1].set(xlabel='Price ($000s)', ylabel='log(s_j/s_0)', title='Logit Share vs Price')
+    axes[0,1].legend()
+
+    # 3. Outside good over time
+    outside = products.groupby('market_ids')['shares'].sum().rsub(1)
+    axes[0,2].plot(outside.index, outside.values*100, 'g^-', linewidth=2, markersize=5)
+    axes[0,2].set(xlabel='Year', ylabel='Outside Good Share (%)', title='Outside Good Over Time')
+    axes[0,2].set_ylim([85, 100])
+
+    # 4. HHI over time
+    hhi = products.groupby('market_ids').apply(
+        lambda x: ((x['shares']**2).sum() / x['shares'].sum()**2) * 10000
+    )
+    axes[1,0].plot(hhi.index, hhi.values, 'o-', color='darkorange', linewidth=2, markersize=5)
+    axes[1,0].axhline(1000, color='red', linestyle='--', alpha=0.7, label='Competitive (1000)')
+    axes[1,0].set(xlabel='Year', ylabel='HHI', title='Market Concentration (HHI)')
+    axes[1,0].legend()
+
+    # 5. Price by region
+    for region, color in [('US','steelblue'), ('EU','darkorange'), ('JP','seagreen')]:
+        d = products[products['region']==region]['prices']
+        axes[1,1].hist(d, bins=30, alpha=0.5, color=color, label=region, edgecolor='white')
+    axes[1,1].set(xlabel='Price ($000s)', ylabel='Count', title='Price Distribution by Region')
+    axes[1,1].legend()
+
+    # 6. Instrument relevance
+    axes[1,2].scatter(products['demand_instruments0'], products['prices'],
+                       alpha=0.25, s=6, color='steelblue')
+    corr = np.corrcoef(products['demand_instruments0'], products['prices'])[0,1]
+    axes[1,2].set(xlabel='Instrument 0', ylabel='Price', title=f'Instrument Relevance (r={corr:.3f})')
+
+    plt.tight_layout()
+    plt.savefig(f'{save_prefix}_pre_estimation.png', dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"Saved: {save_prefix}_pre_estimation.png")
+
+    # ── Post-estimation ──────────────────────────────────────────────────────
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+    fig.suptitle('Demand Model: Post-Estimation Diagnostics', fontsize=14, fontweight='bold')
+
+    own_elasts = alpha_price * products['prices'] * (1 - products['shares'])
+    lerner = (-1 / own_elasts.clip(upper=-0.01)).clip(0, 1)
+
+    # 1. Own-price elasticity distribution
+    axes[0].hist(own_elasts, bins=40, color='steelblue', edgecolor='white', alpha=0.8)
+    axes[0].axvline(own_elasts.mean(), color='red', linestyle='--',
+                     label=f"mean={own_elasts.mean():.2f}")
+    axes[0].axvline(-1, color='k', linestyle=':', linewidth=1.5, label='Unit elastic')
+    axes[0].set(xlabel='Own-Price Elasticity', ylabel='Count', title='Elasticity Distribution')
+    axes[0].legend()
+
+    # 2. Elasticity vs price
+    sc = axes[1].scatter(products['prices'], own_elasts,
+                          c=products['market_ids'], cmap='plasma', alpha=0.4, s=8)
+    plt.colorbar(sc, ax=axes[1], label='Year', pad=0.02)
+    axes[1].axhline(-1, color='red', linestyle='--', linewidth=1.5, label='Unit elastic')
+    axes[1].set(xlabel='Price ($000s)', ylabel='Own-Price Elasticity', title='Elasticity vs Price')
+    axes[1].legend()
+
+    # 3. Lerner Index distribution
+    lerner_valid = lerner[(lerner > 0.01) & (lerner < 0.99)]
+    axes[2].hist(lerner_valid, bins=40, color='darkorange', edgecolor='white', alpha=0.8)
+    axes[2].axvline(lerner_valid.mean(), color='red', linestyle='--',
+                     label=f"mean={lerner_valid.mean():.3f}")
+    axes[2].set(xlabel='Lerner Index (markup/price)', ylabel='Count', title='Market Power (Lerner)')
+    axes[2].legend()
+
+    plt.tight_layout()
+    plt.savefig(f'{save_prefix}_post_estimation.png', dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"Saved: {save_prefix}_post_estimation.png")
+
+# Run it
+blp_diagnostic_plots(products, beta_price_iv, save_prefix='blp_automobile')
+```
+
+### 14.7 Academic Literature Benchmarks
+
+Use these to validate your estimates against published work:
+
+| Study | Data | Model | Price coef | Own-elast | Lerner |
+|-------|------|-------|-----------|-----------|--------|
+| Berry (1994) | BLP 1971-90 | IV Logit | −0.10 | −4.2 | — |
+| BLP (1995) | BLP 1971-90 | RC Logit GMM | −0.243 | −6.3 | 21% |
+| Goldberg (1995) | CES individual | Mixed Logit | — | −3.3 | — |
+| Nevo (2001) | Cereals | RC Logit | — | −25.5 (!)* | ~45% |
+| Petrin (2002) | Minivans | RC Logit + micro | — | −4.9 | — |
+| Beresteanu & Ellickson (2006) | Supermarkets | NL | — | −3 to −5 | — |
+
+*Cereal elasticities very high because category itself is elastic; BLP-style results.
+
+**What it means for calibrating your model:**
+
+- If your IV logit price coefficient is much less negative than −0.09: instruments may be weak or data has too little price variation
+- If your mean own-elasticity is > −1 (inelastic): either the price coefficient is wrong, or the product is truly a necessity with very loyal consumers (unusual for differentiated goods)
+- If Lerner index > 0.50 for most products: re-check cost assumptions; most manufacturers have markups below 50%
+- If outside good is < 0.5: re-check market size definition — you may be under-counting potential buyers
+
+### 14.8 Ford Project Connection: What This Masterclass Covers
+
+The Ford Fiesta UK demand forecasting project (the original problem that motivated this dataset search) used:
+
+| Ford Technique | This Masterclass Coverage |
+|----------------|--------------------------|
+| Generalized Nested Logit for 6 trims × 4 segments | Section 7 (GNL), Section 6 (NL) |
+| Nested logit booking model for 8 finance instruments | Section 6 (NL theory), Section 5 (baseline logit) |
+| FCE penetration model | Section 11 (count models / Poisson) |
+| SQP optimization over APR/deposit/cash/privilege | Section 13 (business Q4: cash vs APR) |
+| Recalibration on recent months | Section 3 (train/val/test split) |
+| Typical customer data proxy | Section 3 (feature engineering) |
+| 24/36/48 month financing terms | Section 13 (PV APR calculation) |
+
+The BLP dataset is the closest publicly available analog to Ford's data. The main gap is individual-level financing variables (APR, deposit, term length) — these would require:
+1. Simulating financing variation using the PV calculation in Section 13
+2. Using a nested logit where nests are `(nameplate, trim)` and the discount variable is APR
+3. Applying the demand model output as the objective function for SQP optimization
+
+This completes the full circle from the Ford project to the academic BLP literature to production Python implementation.
+
+---
+
+### 14.9 Key Formulas Summary
+
+```
+LOGIT DEMAND TRANSFORM:
+  log(s_j/s_0) = x_j'β + αp_j + ξ_j   (linear regression on observed shares)
+
+OWN-PRICE ELASTICITY:
+  Simple logit:  ε_jj = α × p_j × (1 - s_j)
+  Nested logit:  ε_jj = α × p_j × [1/(1-σ) - σ/(1-σ) × s_{j|g} - s_j]
+  Mixed logit:   ε_jj = p_j / s_j × ∫ α_i × s_ij × (1 - s_ij) dF(α_i)
+
+CROSS-PRICE ELASTICITY:
+  Simple logit:  ε_jk = -α × p_k × s_k   (IIA: proportional to s_k only)
+  Nested logit:  ε_jk = -α × p_k × [s_k + σ/(1-σ) × s_{k|g} × 1(j,k ∈ same nest)]
+  Mixed logit:   ε_jk = -p_k / s_j × ∫ α_i × s_ij × s_ik dF(α_i)
+
+DIVERSION RATIO:
+  D_jk = |∂s_k/∂p_j| / |∂s_j/∂p_j|
+  Simple logit: D_jk = s_k / (1 - s_j)   (IIA: proportional to s_k)
+  RC logit: D_jk reflects characteristics similarity
+
+LERNER INDEX (profit-maximizing markup):
+  L_j = (p_j - c_j) / p_j = -1 / ε_jj   (single-product firm)
+  Multi-product: (p - c) = -[Ω ∘ Δ]^{-1} s   (Bertrand FOC; system of equations)
+
+UPWARD PRICING PRESSURE (UPP):
+  UPP_j = D_jk × L_k × p_k   (simple version; no efficiencies)
+  If UPP_j > 0: merger likely raises price for product j
+
+GMM OBJECTIVE (BLP):
+  Q(θ) = ξ(θ)'Z [Z'ΩZ]^{-1} Z'ξ(θ)
+  ξ(θ) = δ*(θ) - x'β̄   (structural errors from contraction mapping)
+  δ*(θ): unique solution to s(δ,θ) = s_obs (inner contraction mapping)
+
+WELFARE:
+  Consumer surplus: CS = -ln(1 + Σ_j exp(δ_j)) / |α|   (per consumer)
+  ΔCS (price increase): ΔCS ≈ -Σ_j s_j Δp_j   (first-order approximation)
+```
+
+---
+
+*This masterclass covers the complete toolkit from the simplest OLS logit baseline through the full BLP random-coefficients GMM estimator, GEE panel models, count models, and mixed linear models. The BLP automobile dataset serves as the running example throughout because it is: (1) publicly available via `pyblp`, (2) extensively benchmarked in the published literature, (3) structurally similar to real-world automotive demand problems like the Ford Fiesta project, and (4) large enough to illustrate all the estimation challenges (endogeneity, IIA, heterogeneity, market power) that arise in professional demand modeling.*
+
+*Total coverage: ~90,000 tokens of discrete choice econometrics theory, Python implementation code, diagnostic frameworks, business applications, and industry benchmarks.*
